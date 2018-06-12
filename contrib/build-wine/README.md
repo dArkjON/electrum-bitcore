@@ -15,7 +15,6 @@ Usage:
  - 7Zip
  - Wine (>= v2)
 
-
 For example:
 
 
@@ -33,6 +32,15 @@ $ wine --version
  wine-2.21
 ```
 
-2. Make sure `/opt` is writable by the current user.
+2. Make sure `/opt` is owned by the current user.
 3. Run `build.sh`.
-4. The generated binaries are in `./dist`.
+
+   As part of the build process the MinGW Installation Manager is run. 
+   The following have to be marked for installation:
+   - mingw32-base
+   - mingw32-gcc-g++ 
+   - msys-base
+   After marking these terminate the Installation Manager (click x).
+   Click "Review Changes" and then "Apply".
+
+4. The generated binaries are in './dist'.

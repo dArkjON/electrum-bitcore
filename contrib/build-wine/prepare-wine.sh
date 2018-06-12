@@ -17,7 +17,7 @@ PYTHON_VERSION=3.5.4
 
 ## These settings probably don't need change
 export WINEPREFIX=/opt/wine64
-#export WINEARCH='win32'
+export WINEARCH='win32'
 
 PYHOME=c:/python$PYTHON_VERSION
 PYTHON="wine $PYHOME/python.exe -OO -B"

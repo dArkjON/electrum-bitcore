@@ -100,7 +100,7 @@ class Satoshis(object):
         return 'Satoshis(%d)'%self.value
 
     def __str__(self):
-        return format_satoshis(self.value) + " BTC"
+        return format_satoshis(self.value) + " BTX"
 
 class Fiat(object):
     def __new__(cls, value, ccy):
@@ -393,9 +393,9 @@ def user_dir():
     elif os.name == 'posix':
         return os.path.join(os.environ["HOME"], ".electrum-bitcore")
     elif "APPDATA" in os.environ:
-        return os.path.join(os.environ["APPDATA"], "Electrum")
+        return os.path.join(os.environ["APPDATA"], "Electrum-Bitcore")
     elif "LOCALAPPDATA" in os.environ:
-        return os.path.join(os.environ["LOCALAPPDATA"], "Electrum")
+        return os.path.join(os.environ["LOCALAPPDATA"], "Electrum-Bitcore")
     else:
         #raise Exception("No home directory found in environment variables.")
         return
@@ -494,10 +494,10 @@ def time_difference(distance_in_time, include_seconds):
         return "over %d years" % (round(distance_in_minutes / 525600))
 
 mainnet_block_explorers = {
-    'Insight.is': ('https://insight.bitcore.cc/',
+    'Bitcore.cc Insight': ('https://insight.bitcore.cc/',
                         {'tx': 'tx/', 'addr': 'address/'}),
-    'system default': ('https://insight.bitcore.cc/',
-                        {'tx': 'tx/', 'addr': 'address/'}),
+    'Chainz Explorer': ('https://chainz.cryptoid.info/btx/',
+                        {'tx': 'tx.dws?', 'addr': 'address.dws?'}),
 }
 
 testnet_block_explorers = {
