@@ -65,16 +65,16 @@ class Test_bitcoin(unittest.TestCase):
 
         sig1 = sign_message_with_wif_privkey(
             'L1TnU2zbNaAqMoVh65Cyvmcjzbrj41Gs9iTLcWbpJCMynXuap6UN', msg1)
-        addr1 = '15hETetDmcXm1mM4sEf7U2KXC9hDHFMSzz'
+        addr1 = '2EvqCtmz6Gf9pvBRZbU7UYzarzjdQaXrjH'
         sig2 = sign_message_with_wif_privkey(
             '5Hxn5C4SQuiV6e62A1MtZmbSeQyrLFhu5uYks62pU5VBUygK2KD', msg2)
-        addr2 = '1GPHVTY8UD9my6jyP4tb2TYJwUbDetyNC6'
+        addr2 = '2UQ6SnRzbkYQRQAETKtYUqMfpzN3iGXSx3'
 
         sig1_b64 = base64.b64encode(sig1)
         sig2_b64 = base64.b64encode(sig2)
 
-        self.assertEqual(sig1_b64, b'H/9jMOnj4MFbH3d7t4yCQ9i7DgZU/VZ278w3+ySv2F4yIsdqjsc5ng3kmN8OZAThgyfCZOQxZCWza9V5XzlVY0Y=')
-        self.assertEqual(sig2_b64, b'G84dmJ8TKIDKMT9qBRhpX2sNmR0y5t+POcYnFFJCs66lJmAs3T8A6Sbpx7KA6yTQ9djQMabwQXRrDomOkIKGn18=')
+        self.assertEqual(sig1_b64, b'H9g4y5HWJNO1RTxgwZNsNT+TLtRYOld+LBVpHwU0ZEt2Iw3ytXOdltlJvQzpyLacrXCacFg9raIthYoxTZak69k=')
+        self.assertEqual(sig2_b64, b'HI+M5b/CYUCtnuLdaMPR0mpJ7V0lK5zUGbk6p3cyyc79aS2sg6DxX/WaJzGnY6boZMPxzKL13xiPQmw5hqq9azg=')
 
         self.assertTrue(verify_message(addr1, sig1, msg1))
         self.assertTrue(verify_message(addr2, sig2, msg2))

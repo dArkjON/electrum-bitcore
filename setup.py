@@ -21,7 +21,7 @@ version = imp.load_source('version', 'lib/version.py')
 if sys.version_info[:3] < (3, 4, 0):
     sys.exit("Error: Electrum requires Python version >= 3.4.0...")
 
-data_files = ['contrib/requirements/' + r for r in ['requirements.txt', 'requirements-hw.txt']]
+data_files = []
 
 if platform.system() in ['Linux', 'FreeBSD', 'DragonFly']:
     parser = argparse.ArgumentParser()
@@ -61,9 +61,6 @@ setup(
     name="Electrum-BitCore",
     version=version.ELECTRUM_VERSION,
     install_requires=requirements,
-    extras_require={
-        'hardware': requirements_hw,
-    },
     packages=[
         'electrum',
         'electrum_gui',
@@ -109,3 +106,8 @@ setup(
     long_description="""Lightweight BitCore Wallet""",
     ext_modules = [ext]
 )
+
+# Optional modules (not required to run Electrum)
+import pip
+opt_modules = requirements_hw + ['pycryptodomex']
+[ pip.main(['install', m]) for m in opt_modules ]
