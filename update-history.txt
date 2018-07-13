@@ -1,4 +1,4 @@
-Commits till 11.03.18 - Last d3065f73bf01a86dc50d902f0a118af4710e802d
-https://github.com/spesmilo/electrum/commit/d3065f73bf01a86dc50d902f0a118af4710e802d
+Commits till 16.03.18 - Last c0ae266d39786662fee5ae9d03788e2d4d372b14
+https://github.com/spesmilo/electrum/commit/c0ae266d39786662fee5ae9d03788e2d4d372b14
 
-https://github.com/spesmilo/electrum/commits/master?before=87f6aa09df702aed26b70cb386c703f39c3fb4df+521
+https://github.com/spesmilo/electrum/commits/master?before=87f6aa09df702aed26b70cb386c703f39c3fb4df+486

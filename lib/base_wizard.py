@@ -202,14 +202,19 @@ class BaseWizard(object):
         # scan devices
         devices = []
         devmgr = self.plugins.device_manager
-        for name, description, plugin in support:
-            try:
-                # FIXME: side-effect: unpaired_device_info sets client.handler
-                u = devmgr.unpaired_device_infos(None, plugin)
-            except:
-                devmgr.print_error("error", name)
-                continue
-            devices += list(map(lambda x: (name, x), u))
+        try:
+            scanned_devices = devmgr.scan_devices()
+        except BaseException as e:
+            devmgr.print_error('error scanning devices: {}'.format(e))
+        else:
+            for name, description, plugin in support:
+                try:
+                    # FIXME: side-effect: unpaired_device_info sets client.handler
+                    u = devmgr.unpaired_device_infos(None, plugin, devices=scanned_devices)
+                except BaseException as e:
+                    devmgr.print_error('error getting device infos for {}: {}'.format(name, e))
+                    continue
+                devices += list(map(lambda x: (name, x), u))
         if not devices:
             msg = ''.join([
                 _('No hardware device detected.') + '\n',
@@ -243,6 +248,9 @@ class BaseWizard(object):
             devmgr.unpair_id(device_info.device.id_)
             self.choose_hw_device(purpose)
             return
+        except UserCancelled:
+            self.choose_hw_device(purpose)
+            return
         except BaseException as e:
             self.show_error(str(e))
             self.choose_hw_device(purpose)
@@ -260,7 +268,7 @@ class BaseWizard(object):
             xpub = self.plugin.get_xpub(device_info.device.id_, derivation, 'standard', self)
             password = keystore.Xpub.get_pubkey_from_xpub(xpub, ())
             try:
-               self.storage.decrypt(password)
+                self.storage.decrypt(password)
             except InvalidPassword:
                 # try to clear session so that user can type another passphrase
                 devmgr = self.plugins.device_manager
@@ -466,10 +474,6 @@ class BaseWizard(object):
 
     def show_xpub_and_add_cosigners(self, xpub):
         self.show_xpub_dialog(xpub=xpub, run_next=lambda x: self.run('choose_keystore'))
-
-    def on_cosigner(self, text, password, i):
-        k = keystore.from_master_key(text, password)
-        self.on_keystore(k)
 
     def choose_seed_type(self):
         title = _('Choose Seed type')

@@ -1,7 +1,7 @@
-#!/usr/bin/env python
+# -*- coding: utf-8 -*-
 #
 # Electrum - lightweight Bitcoin client
-# Copyright (C) 2015 Thomas Voegtlin
+# Copyright (C) 2016 Thomas Voegtlin
 #
 # Permission is hereby granted, free of charge, to any person
 # obtaining a copy of this software and associated documentation files
@@ -22,539 +22,511 @@
 # ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
 # CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
-from collections import namedtuple
-import traceback
-import sys
+
 import os
-import imp
-import pkgutil
-import time
-import threading
+import sys
+import traceback
 
-from .util import print_error
-from .i18n import _
-from .util import profiler, PrintError, DaemonThread, UserCancelled, ThreadJob
 from . import bitcoin
+from . import keystore
+from .keystore import bip44_derivation
+from .wallet import Imported_Wallet, Standard_Wallet, Multisig_Wallet, wallet_types
+from .storage import STO_EV_USER_PW, STO_EV_XPUB_PW, get_derivation_used_for_hw_device_encryption
+from .i18n import _
+from .util import UserCancelled, InvalidPassword
 
-plugin_loaders = {}
-hook_names = set()
-hooks = {}
+# hardware device setup purpose
+HWD_SETUP_NEW_WALLET, HWD_SETUP_DECRYPT_WALLET = range(0, 2)
+
+class ScriptTypeNotSupported(Exception): pass
 
 
-class Plugins(DaemonThread):
+class BaseWizard(object):
 
-    @profiler
-    def __init__(self, config, is_local, gui_name):
-        DaemonThread.__init__(self)
-        if is_local:
-            find = imp.find_module('plugins')
-            plugins = imp.load_module('electrum_plugins', *find)
-        else:
-            plugins = __import__('electrum_plugins')
-        self.pkgpath = os.path.dirname(plugins.__file__)
+    def __init__(self, config, storage):
+        super(BaseWizard, self).__init__()
         self.config = config
-        self.hw_wallets = {}
-        self.plugins = {}
-        self.gui_name = gui_name
-        self.descriptions = {}
-        self.device_manager = DeviceMgr(config)
-        self.load_plugins()
-        self.add_jobs(self.device_manager.thread_jobs())
-        self.start()
-
-    def load_plugins(self):
-        for loader, name, ispkg in pkgutil.iter_modules([self.pkgpath]):
-            # do not load deprecated plugins
-            if name in ['plot', 'exchange_rate']:
-                continue
-            m = loader.find_module(name).load_module(name)
-            d = m.__dict__
-            gui_good = self.gui_name in d.get('available_for', [])
-            if not gui_good:
-                continue
-            details = d.get('registers_wallet_type')
-            if details:
-                self.register_wallet_type(name, gui_good, details)
-            details = d.get('registers_keystore')
-            if details:
-                self.register_keystore(name, gui_good, details)
-            self.descriptions[name] = d
-            if not d.get('requires_wallet_type') and self.config.get('use_' + name):
-                try:
-                    self.load_plugin(name)
-                except BaseException as e:
-                    traceback.print_exc(file=sys.stdout)
-                    self.print_error("cannot initialize plugin %s:" % name, str(e))
-
-    def get(self, name):
-        return self.plugins.get(name)
-
-    def count(self):
-        return len(self.plugins)
-
-    def load_plugin(self, name):
-        if name in self.plugins:
-            return self.plugins[name]
-        full_name = 'electrum_plugins.' + name + '.' + self.gui_name
-        loader = pkgutil.find_loader(full_name)
-        if not loader:
-            raise RuntimeError("%s implementation for %s plugin not found"
-                               % (self.gui_name, name))
-        p = loader.load_module(full_name)
-        plugin = p.Plugin(self, self.config, name)
-        self.add_jobs(plugin.thread_jobs())
-        self.plugins[name] = plugin
-        self.print_error("loaded", name)
-        return plugin
-
-    def close_plugin(self, plugin):
-        self.remove_jobs(plugin.thread_jobs())
-
-    def enable(self, name):
-        self.config.set_key('use_' + name, True, True)
-        p = self.get(name)
-        if p:
-            return p
-        return self.load_plugin(name)
-
-    def disable(self, name):
-        self.config.set_key('use_' + name, False, True)
-        p = self.get(name)
-        if not p:
-            return
-        self.plugins.pop(name)
-        p.close()
-        self.print_error("closed", name)
-
-    def toggle(self, name):
-        p = self.get(name)
-        return self.disable(name) if p else self.enable(name)
-
-    def is_available(self, name, w):
-        d = self.descriptions.get(name)
-        if not d:
-            return False
-        deps = d.get('requires', [])
-        for dep, s in deps:
-            try:
-                __import__(dep)
-            except ImportError:
-                return False
-        requires = d.get('requires_wallet_type', [])
-        return not requires or w.wallet_type in requires
-
-    def get_hardware_support(self):
-        out = []
-        for name, (gui_good, details) in self.hw_wallets.items():
-            if gui_good:
-                try:
-                    p = self.get_plugin(name)
-                    if p.is_enabled():
-                        out.append([name, details[2], p])
-                except:
-                    traceback.print_exc()
-                    self.print_error("cannot load plugin for:", name)
-        return out
-
-    def register_wallet_type(self, name, gui_good, wallet_type):
-        from .wallet import register_wallet_type, register_constructor
-        self.print_error("registering wallet type", (wallet_type, name))
-        def loader():
-            plugin = self.get_plugin(name)
-            register_constructor(wallet_type, plugin.wallet_class)
-        register_wallet_type(wallet_type)
-        plugin_loaders[wallet_type] = loader
-
-    def register_keystore(self, name, gui_good, details):
-        from .keystore import register_keystore
-        def dynamic_constructor(d):
-            return self.get_plugin(name).keystore_class(d)
-        if details[0] == 'hardware':
-            self.hw_wallets[name] = (gui_good, details)
-            self.print_error("registering hardware %s: %s" %(name, details))
-            register_keystore(details[1], dynamic_constructor)
-
-    def get_plugin(self, name):
-        if not name in self.plugins:
-            self.load_plugin(name)
-        return self.plugins[name]
-
-    def run(self):
-        while self.is_running():
-            time.sleep(0.1)
-            self.run_jobs()
-        self.on_stop()
-
-
-def hook(func):
-    hook_names.add(func.__name__)
-    return func
-
-def run_hook(name, *args):
-    results = []
-    f_list = hooks.get(name, [])
-    for p, f in f_list:
-        if p.is_enabled():
-            try:
-                r = f(*args)
-            except Exception:
-                print_error("Plugin error")
-                traceback.print_exc(file=sys.stdout)
-                r = False
-            if r:
-                results.append(r)
-
-    if results:
-        assert len(results) == 1, results
-        return results[0]
-
-
-class BasePlugin(PrintError):
-
-    def __init__(self, parent, config, name):
-        self.parent = parent  # The plugins object
-        self.name = name
-        self.config = config
+        self.storage = storage
         self.wallet = None
-        # add self to hooks
-        for k in dir(self):
-            if k in hook_names:
-                l = hooks.get(k, [])
-                l.append((self, getattr(self, k)))
-                hooks[k] = l
+        self.stack = []
+        self.plugin = None
+        self.keystores = []
+        self.is_kivy = config.get('gui') == 'kivy'
+        self.seed_type = None
 
-    def diagnostic_name(self):
-        return self.name
-
-    def __str__(self):
-        return self.name
-
-    def close(self):
-        # remove self from hooks
-        for k in dir(self):
-            if k in hook_names:
-                l = hooks.get(k, [])
-                l.remove((self, getattr(self, k)))
-                hooks[k] = l
-        self.parent.close_plugin(self)
-        self.on_close()
-
-    def on_close(self):
-        pass
-
-    def requires_settings(self):
-        return False
-
-    def thread_jobs(self):
-        return []
-
-    def is_enabled(self):
-        return self.is_available() and self.config.get('use_'+self.name) is True
-
-    def is_available(self):
-        return True
-
-    def can_user_disable(self):
-        return True
-
-    def settings_dialog(self):
-        pass
-
-
-class DeviceNotFoundError(Exception):
-    pass
-
-class DeviceUnpairableError(Exception):
-    pass
-
-Device = namedtuple("Device", "path interface_number id_ product_key usage_page")
-DeviceInfo = namedtuple("DeviceInfo", "device label initialized")
-
-class DeviceMgr(ThreadJob, PrintError):
-    '''Manages hardware clients.  A client communicates over a hardware
-    channel with the device.
-
-    In addition to tracking device HID IDs, the device manager tracks
-    hardware wallets and manages wallet pairing.  A HID ID may be
-    paired with a wallet when it is confirmed that the hardware device
-    matches the wallet, i.e. they have the same master public key.  A
-    HID ID can be unpaired if e.g. it is wiped.
-
-    Because of hotplugging, a wallet must request its client
-    dynamically each time it is required, rather than caching it
-    itself.
-
-    The device manager is shared across plugins, so just one place
-    does hardware scans when needed.  By tracking HID IDs, if a device
-    is plugged into a different port the wallet is automatically
-    re-paired.
-
-    Wallets are informed on connect / disconnect events.  It must
-    implement connected(), disconnected() callbacks.  Being connected
-    implies a pairing.  Callbacks can happen in any thread context,
-    and we do them without holding the lock.
-
-    Confusingly, the HID ID (serial number) reported by the HID system
-    doesn't match the device ID reported by the device itself.  We use
-    the HID IDs.
-
-    This plugin is thread-safe.  Currently only devices supported by
-    hidapi are implemented.'''
-
-    def __init__(self, config):
-        super(DeviceMgr, self).__init__()
-        # Keyed by xpub.  The value is the device id
-        # has been paired, and None otherwise.
-        self.xpub_ids = {}
-        # A list of clients.  The key is the client, the value is
-        # a (path, id_) pair.
-        self.clients = {}
-        # What we recognise.  Each entry is a (vendor_id, product_id)
-        # pair.
-        self.recognised_hardware = set()
-        # Custom enumerate functions for devices we don't know about.
-        self.enumerate_func = set()
-        # For synchronization
-        self.lock = threading.RLock()
-        self.hid_lock = threading.RLock()
-        self.config = config
-
-    def thread_jobs(self):
-        # Thread job to handle device timeouts
-        return [self]
-
-    def run(self):
-        '''Handle device timeouts.  Runs in the context of the Plugins
-        thread.'''
-        with self.lock:
-            clients = list(self.clients.keys())
-        cutoff = time.time() - self.config.get_session_timeout()
-        for client in clients:
-            client.timeout(cutoff)
-
-    def register_devices(self, device_pairs):
-        for pair in device_pairs:
-            self.recognised_hardware.add(pair)
-
-    def register_enumerate_func(self, func):
-        self.enumerate_func.add(func)
-
-    def create_client(self, device, handler, plugin):
-        # Get from cache first
-        client = self.client_lookup(device.id_)
-        if client:
-            return client
-        client = plugin.create_client(device, handler)
-        if client:
-            self.print_error("Registering", client)
-            with self.lock:
-                self.clients[client] = (device.path, device.id_)
-        return client
-
-    def xpub_id(self, xpub):
-        with self.lock:
-            return self.xpub_ids.get(xpub)
-
-    def xpub_by_id(self, id_):
-        with self.lock:
-            for xpub, xpub_id in self.xpub_ids.items():
-                if xpub_id == id_:
-                    return xpub
-            return None
-
-    def unpair_xpub(self, xpub):
-        with self.lock:
-            if not xpub in self.xpub_ids:
-                return
-            _id = self.xpub_ids.pop(xpub)
-            self._close_client(_id)
-
-    def unpair_id(self, id_):
-        xpub = self.xpub_by_id(id_)
-        if xpub:
-            self.unpair_xpub(xpub)
+    def run(self, *args):
+        action = args[0]
+        args = args[1:]
+        self.stack.append((action, args))
+        if not action:
+            return
+        if type(action) is tuple:
+            self.plugin, action = action
+        if self.plugin and hasattr(self.plugin, action):
+            f = getattr(self.plugin, action)
+            f(self, *args)
+        elif hasattr(self, action):
+            f = getattr(self, action)
+            f(*args)
         else:
-            self._close_client(id_)
+            raise BaseException("unknown action", action)
 
-    def _close_client(self, id_):
-        client = self.client_lookup(id_)
-        self.clients.pop(client, None)
-        if client:
-            client.close()
+    def can_go_back(self):
+        return len(self.stack)>1
 
-    def pair_xpub(self, xpub, id_):
-        with self.lock:
-            self.xpub_ids[xpub] = id_
+    def go_back(self):
+        if not self.can_go_back():
+            return
+        self.stack.pop()
+        action, args = self.stack.pop()
+        self.run(action, *args)
 
-    def client_lookup(self, id_):
-        with self.lock:
-            for client, (path, client_id) in self.clients.items():
-                if client_id == id_:
-                    return client
-        return None
+    def new(self):
+        name = os.path.basename(self.storage.path)
+        title = _("Create") + ' ' + name
+        message = '\n'.join([
+            _("What kind of wallet do you want to create?")
+        ])
+        wallet_kinds = [
+            ('standard',  _("Standard wallet")),
+            ('2fa', _("Wallet with two-factor authentication")),
+            ('multisig',  _("Multi-signature wallet")),
+            ('imported',  _("Import Bitcoin addresses or private keys")),
+        ]
+        choices = [pair for pair in wallet_kinds if pair[0] in wallet_types]
+        self.choice_dialog(title=title, message=message, choices=choices, run_next=self.on_wallet_type)
 
-    def client_by_id(self, id_):
-        '''Returns a client for the device ID if one is registered.  If
-        a device is wiped or in bootloader mode pairing is impossible;
-        in such cases we communicate by device ID and not wallet.'''
-        self.scan_devices()
-        return self.client_lookup(id_)
+    def load_2fa(self):
+        self.storage.put('wallet_type', '2fa')
+        self.storage.put('use_trustedcoin', True)
+        self.plugin = self.plugins.load_plugin('trustedcoin')
 
-    def client_for_keystore(self, plugin, handler, keystore, force_pair):
-        self.print_error("getting client for keystore")
-        if handler is None:
-            raise BaseException(_("Handler not found for") + ' ' + plugin.name + '\n' + _("A library is probably missing."))
-        handler.update_status(False)
-        devices = self.scan_devices()
-        xpub = keystore.xpub
-        derivation = keystore.get_derivation()
-        client = self.client_by_xpub(plugin, xpub, handler, devices)
-        if client is None and force_pair:
-            info = self.select_device(plugin, handler, keystore, devices)
-            client = self.force_pair_xpub(plugin, handler, info, xpub, derivation, devices)
-        if client:
-            handler.update_status(True)
-        self.print_error("end client for keystore")
-        return client
+    def on_wallet_type(self, choice):
+        self.wallet_type = choice
+        if choice == 'standard':
+            action = 'choose_keystore'
+        elif choice == 'multisig':
+            action = 'choose_multisig'
+        elif choice == '2fa':
+            self.load_2fa()
+            action = self.storage.get_action()
+        elif choice == 'imported':
+            action = 'import_addresses_or_keys'
+        self.run(action)
 
-    def client_by_xpub(self, plugin, xpub, handler, devices):
-        _id = self.xpub_id(xpub)
-        client = self.client_lookup(_id)
-        if client:
-            # An unpaired client might have another wallet's handler
-            # from a prior scan.  Replace to fix dialog parenting.
-            client.handler = handler
-            return client
+    def choose_multisig(self):
+        def on_multisig(m, n):
+            self.multisig_type = "%dof%d"%(m, n)
+            self.storage.put('wallet_type', self.multisig_type)
+            self.n = n
+            self.run('choose_keystore')
+        self.multisig_dialog(run_next=on_multisig)
 
-        for device in devices:
-            if device.id_ == _id:
-                return self.create_client(device, handler, plugin)
+    def choose_keystore(self):
+        assert self.wallet_type in ['standard', 'multisig']
+        i = len(self.keystores)
+        title = _('Add cosigner') + ' (%d of %d)'%(i+1, self.n) if self.wallet_type=='multisig' else _('Keystore')
+        if self.wallet_type =='standard' or i==0:
+            message = _('Do you want to create a new seed, or to restore a wallet using an existing seed?')
+            choices = [
+                ('choose_seed_type', _('Create a new seed')),
+                ('restore_from_seed', _('I already have a seed')),
+                ('restore_from_key', _('Use a master key')),
+            ]
+            if not self.is_kivy:
+                choices.append(('choose_hw_device',  _('Use a hardware device')))
+        else:
+            message = _('Add a cosigner to your multi-sig wallet')
+            choices = [
+                ('restore_from_key', _('Enter cosigner key')),
+                ('restore_from_seed', _('Enter cosigner seed')),
+            ]
+            if not self.is_kivy:
+                choices.append(('choose_hw_device',  _('Cosign with hardware device')))
 
+        self.choice_dialog(title=title, message=message, choices=choices, run_next=self.run)
 
-    def force_pair_xpub(self, plugin, handler, info, xpub, derivation, devices):
-        # The wallet has not been previously paired, so let the user
-        # choose an unpaired device and compare its first address.
-        xtype = bitcoin.xpub_type(xpub)
-        client = self.client_lookup(info.device.id_)
-        if client and client.is_pairable():
-            # See comment above for same code
-            client.handler = handler
-            # This will trigger a PIN/passphrase entry request
-            try:
-                client_xpub = client.get_xpub(derivation, xtype)
-            except (UserCancelled, RuntimeError):
-                 # Bad / cancelled PIN / passphrase
-                client_xpub = None
-            if client_xpub == xpub:
-                self.pair_xpub(xpub, info.device.id_)
-                return client
+    def import_addresses_or_keys(self):
+        v = lambda x: keystore.is_address_list(x) or keystore.is_private_key_list(x)
+        title = _("Import Bitcoin Addresses")
+        message = _("Enter a list of Bitcoin addresses (this will create a watching-only wallet), or a list of private keys.")
+        self.add_xpub_dialog(title=title, message=message, run_next=self.on_import,
+                             is_valid=v, allow_multi=True)
 
-        # The user input has wrong PIN or passphrase, or cancelled input,
-        # or it is not pairable
-        raise DeviceUnpairableError(
-            _('Electrum cannot pair with your {}.\n\n'
-              'Before you request bitcoins to be sent to addresses in this '
-              'wallet, ensure you can pair with your device, or that you have '
-              'its seed (and passphrase, if any).  Otherwise all bitcoins you '
-              'receive will be unspendable.').format(plugin.device))
+    def on_import(self, text):
+        # create a temporary wallet and exploit that modifications
+        # will be reflected on self.storage
+        if keystore.is_address_list(text):
+            w = Imported_Wallet(self.storage)
+            for x in text.split():
+                w.import_address(x)
+        elif keystore.is_private_key_list(text):
+            k = keystore.Imported_KeyStore({})
+            self.storage.put('keystore', k.dump())
+            w = Imported_Wallet(self.storage)
+            for x in keystore.get_private_keys(text):
+                w.import_private_key(x, None)
+            self.keystores.append(w.keystore)
+        else:
+            return self.terminate()
+        return self.run('create_wallet')
 
-    def unpaired_device_infos(self, handler, plugin, devices=None):
-        '''Returns a list of DeviceInfo objects: one for each connected,
-        unpaired device accepted by the plugin.'''
-        if devices is None:
-            devices = self.scan_devices()
-        devices = [dev for dev in devices if not self.xpub_by_id(dev.id_)]
-        infos = []
-        for device in devices:
-            if not device.product_key in plugin.DEVICE_IDS:
-                continue
-            client = self.create_client(device, handler, plugin)
-            if not client:
-                continue
-            infos.append(DeviceInfo(device, client.label(), client.is_initialized()))
+    def restore_from_key(self):
+        if self.wallet_type == 'standard':
+            v = keystore.is_master_key
+            title = _("Create keystore from a master key")
+            message = ' '.join([
+                _("To create a watching-only wallet, please enter your master public key (xpub/ypub/zpub)."),
+                _("To create a spending wallet, please enter a master private key (xprv/yprv/zprv).")
+            ])
+            self.add_xpub_dialog(title=title, message=message, run_next=self.on_restore_from_key, is_valid=v)
+        else:
+            i = len(self.keystores) + 1
+            self.add_cosigner_dialog(index=i, run_next=self.on_restore_from_key, is_valid=keystore.is_bip32_key)
 
-        return infos
+    def on_restore_from_key(self, text):
+        k = keystore.from_master_key(text)
+        self.on_keystore(k)
 
-    def select_device(self, plugin, handler, keystore, devices=None):
-        '''Ask the user to select a device to use if there is more than one,
-        and return the DeviceInfo for the device.'''
-        while True:
-            infos = self.unpaired_device_infos(handler, plugin, devices)
-            if infos:
-                break
-            msg = _('Please insert your {}.  Verify the cable is '
-                    'connected and that no other application is using it.\n\n'
-                    'Try to connect again?').format(plugin.device)
-            if not handler.yes_no_question(msg):
-                raise UserCancelled()
-            devices = None
-        if len(infos) == 1:
-            return infos[0]
-        # select device by label
-        for info in infos:
-            if info.label == keystore.label:
-                return info
-        msg = _("Please select which {} device to use:").format(plugin.device)
-        descriptions = [str(info.label) + ' (%s)'%(_("initialized") if info.initialized else _("wiped")) for info in infos]
-        c = handler.query_choice(msg, descriptions)
-        if c is None:
-            raise UserCancelled()
-        info = infos[c]
-        # save new label
-        keystore.set_label(info.label)
-        if handler.win.wallet is not None:
-            handler.win.wallet.save_keystore()
-        return info
-
-    def scan_devices(self):
-        # All currently supported hardware libraries use hid, so we
-        # assume it here.  This can be easily abstracted if necessary.
-        # Note this import must be local so those without hardware
-        # wallet libraries are not affected.
-        import hid
-        self.print_error("scanning devices...")
-        with self.hid_lock:
-            hid_list = hid.enumerate(0, 0)
-
-        # First see what's connected that we know about
+    def choose_hw_device(self, purpose=HWD_SETUP_NEW_WALLET):
+        title = _('Hardware Keystore')
+        # check available plugins
+        support = self.plugins.get_hardware_support()
+        if not support:
+            msg = '\n'.join([
+                _('No hardware wallet support found on your system.'),
+                _('Please install the relevant libraries (eg python-trezor for Trezor).'),
+            ])
+            self.confirm_dialog(title=title, message=msg, run_next= lambda x: self.choose_hw_device(purpose))
+            return
+        # scan devices
         devices = []
-        for d in hid_list:
-            product_key = (d['vendor_id'], d['product_id'])
-            if product_key in self.recognised_hardware:
-                # Older versions of hid don't provide interface_number
-                interface_number = d.get('interface_number', -1)
-                usage_page = d['usage_page']
-                id_ = d['serial_number']
-                if len(id_) == 0:
-                    id_ = str(d['path'])
-                id_ += str(interface_number) + str(usage_page)
-                devices.append(Device(d['path'], interface_number,
-                                      id_, product_key, usage_page))
+        devmgr = self.plugins.device_manager
+        try:
+            scanned_devices = devmgr.scan_devices()
+        except BaseException as e:
+            devmgr.print_error('error scanning devices: {}'.format(e))
+        else:
+            for name, description, plugin in support:
+                try:
+                    # FIXME: side-effect: unpaired_device_info sets client.handler
+                    u = devmgr.unpaired_device_infos(None, plugin, devices=scanned_devices)
+                except BaseException as e:
+                    devmgr.print_error('error getting device infos for {}: {}'.format(name, e))
+                    continue
+                devices += list(map(lambda x: (name, x), u))
+        if not devices:
+            msg = ''.join([
+                _('No hardware device detected.') + '\n',
+                _('To trigger a rescan, press \'Next\'.') + '\n\n',
+                _('If your device is not detected on Windows, go to "Settings", "Devices", "Connected devices", and do "Remove device". Then, plug your device again.') + ' ',
+                _('On Linux, you might have to add a new permission to your udev rules.'),
+            ])
+            self.confirm_dialog(title=title, message=msg, run_next= lambda x: self.choose_hw_device(purpose))
+            return
+        # select device
+        self.devices = devices
+        choices = []
+        for name, info in devices:
+            state = _("initialized") if info.initialized else _("wiped")
+            label = info.label or _("An unnamed {}").format(name)
+            descr = "%s [%s, %s]" % (label, name, state)
+            choices.append(((name, info), descr))
+        msg = _('Select a device') + ':'
+        self.choice_dialog(title=title, message=msg, choices=choices, run_next= lambda *args: self.on_device(*args, purpose=purpose))
 
-        # Let plugin handlers enumerate devices we don't know about
-        for f in self.enumerate_func:
-            try:
-                new_devices = f()
-            except BaseException as e:
-                self.print_error('custom device enum failed. func {}, error {}'
-                                 .format(str(f), str(e)))
+    def on_device(self, name, device_info, *, purpose):
+        self.plugin = self.plugins.get_plugin(name)
+        try:
+            self.plugin.setup_device(device_info, self, purpose)
+        except OSError as e:
+            self.show_error(_('We encountered an error while connecting to your device:')
+                            + '\n' + str(e) + '\n'
+                            + _('To try to fix this, we will now re-pair with your device.') + '\n'
+                            + _('Please try again.'))
+            devmgr = self.plugins.device_manager
+            devmgr.unpair_id(device_info.device.id_)
+            self.choose_hw_device(purpose)
+            return
+        except UserCancelled:
+            self.choose_hw_device(purpose)
+            return
+        except BaseException as e:
+            self.show_error(str(e))
+            self.choose_hw_device(purpose)
+            return
+        if purpose == HWD_SETUP_NEW_WALLET:
+            if self.wallet_type=='multisig':
+                # There is no general standard for HD multisig.
+                # This is partially compatible with BIP45; assumes index=0
+                self.on_hw_derivation(name, device_info, "m/45'/0")
             else:
-                devices.extend(new_devices)
+                f = lambda x: self.run('on_hw_derivation', name, device_info, str(x))
+                self.derivation_dialog(f)
+        elif purpose == HWD_SETUP_DECRYPT_WALLET:
+            derivation = get_derivation_used_for_hw_device_encryption()
+            xpub = self.plugin.get_xpub(device_info.device.id_, derivation, 'standard', self)
+            password = keystore.Xpub.get_pubkey_from_xpub(xpub, ())
+            try:
+                self.storage.decrypt(password)
+            except InvalidPassword:
+                # try to clear session so that user can type another passphrase
+                devmgr = self.plugins.device_manager
+                client = devmgr.client_by_id(device_info.device.id_)
+                if hasattr(client, 'clear_session'):  # FIXME not all hw wallet plugins have this
+                    client.clear_session()
+                raise
+        else:
+            raise Exception('unknown purpose: %s' % purpose)
 
-        # Now find out what was disconnected
-        pairs = [(dev.path, dev.id_) for dev in devices]
-        disconnected_ids = []
-        with self.lock:
-            connected = {}
-            for client, pair in self.clients.items():
-                if pair in pairs:
-                    connected[client] = pair
-                else:
-                    disconnected_ids.append(pair[1])
-            self.clients = connected
+    def derivation_dialog(self, f):
+        default = bip44_derivation(0, bip43_purpose=44)
+        message = '\n'.join([
+            _('Enter your wallet derivation here.'),
+            _('If you are not sure what this is, leave this field unchanged.')
+        ])
+        presets = (
+            ('legacy BIP44', bip44_derivation(0, bip43_purpose=44)),
+            ('p2sh-segwit BIP49', bip44_derivation(0, bip43_purpose=49)),
+            ('native-segwit BIP84', bip44_derivation(0, bip43_purpose=84)),
+        )
+        while True:
+            try:
+                self.line_dialog(run_next=f, title=_('Derivation'), message=message,
+                                 default=default, test=bitcoin.is_bip32_derivation,
+                                 presets=presets)
+                return
+            except ScriptTypeNotSupported as e:
+                self.show_error(e)
+                # let the user choose again
 
-        # Unpair disconnected devices
-        for id_ in disconnected_ids:
-            self.unpair_id(id_)
+    def on_hw_derivation(self, name, device_info, derivation):
+        from .keystore import hardware_keystore
+        xtype = keystore.xtype_from_derivation(derivation)
+        try:
+            xpub = self.plugin.get_xpub(device_info.device.id_, derivation, xtype, self)
+        except ScriptTypeNotSupported:
+            raise  # this is handled in derivation_dialog
+        except BaseException as e:
+            self.show_error(e)
+            return
+        d = {
+            'type': 'hardware',
+            'hw_type': name,
+            'derivation': derivation,
+            'xpub': xpub,
+            'label': device_info.label,
+        }
+        k = hardware_keystore(d)
+        self.on_keystore(k)
 
-        return devices
+    def passphrase_dialog(self, run_next):
+        title = _('Seed extension')
+        message = '\n'.join([
+            _('You may extend your seed with custom words.'),
+            _('Your seed extension must be saved together with your seed.'),
+        ])
+        warning = '\n'.join([
+            _('Note that this is NOT your encryption password.'),
+            _('If you do not know what this is, leave this field empty.'),
+        ])
+        self.line_dialog(title=title, message=message, warning=warning, default='', test=lambda x:True, run_next=run_next)
+
+    def restore_from_seed(self):
+        self.opt_bip39 = True
+        self.opt_ext = True
+        is_cosigning_seed = lambda x: bitcoin.seed_type(x) in ['standard', 'segwit']
+        test = bitcoin.is_seed if self.wallet_type == 'standard' else is_cosigning_seed
+        self.restore_seed_dialog(run_next=self.on_restore_seed, test=test)
+
+    def on_restore_seed(self, seed, is_bip39, is_ext):
+        self.seed_type = 'bip39' if is_bip39 else bitcoin.seed_type(seed)
+        if self.seed_type == 'bip39':
+            f = lambda passphrase: self.on_restore_bip39(seed, passphrase)
+            self.passphrase_dialog(run_next=f) if is_ext else f('')
+        elif self.seed_type in ['standard', 'segwit']:
+            f = lambda passphrase: self.run('create_keystore', seed, passphrase)
+            self.passphrase_dialog(run_next=f) if is_ext else f('')
+        elif self.seed_type == 'old':
+            self.run('create_keystore', seed, '')
+        elif self.seed_type == '2fa':
+            if self.is_kivy:
+                self.show_error(_('2FA seeds are not supported in this version'))
+                self.run('restore_from_seed')
+            else:
+                self.load_2fa()
+                self.run('on_restore_seed', seed, is_ext)
+        else:
+            raise BaseException('Unknown seed type', self.seed_type)
+
+    def on_restore_bip39(self, seed, passphrase):
+        f = lambda x: self.run('on_bip43', seed, passphrase, str(x))
+        self.derivation_dialog(f)
+
+    def create_keystore(self, seed, passphrase):
+        k = keystore.from_seed(seed, passphrase, self.wallet_type == 'multisig')
+        self.on_keystore(k)
+
+    def on_bip43(self, seed, passphrase, derivation):
+        k = keystore.from_bip39_seed(seed, passphrase, derivation)
+        self.on_keystore(k)
+
+    def on_keystore(self, k):
+        has_xpub = isinstance(k, keystore.Xpub)
+        if has_xpub:
+            from .bitcoin import xpub_type
+            t1 = xpub_type(k.xpub)
+        if self.wallet_type == 'standard':
+            if has_xpub and t1 not in ['standard', 'p2wpkh', 'p2wpkh-p2sh']:
+                self.show_error(_('Wrong key type') + ' %s'%t1)
+                self.run('choose_keystore')
+                return
+            self.keystores.append(k)
+            self.run('create_wallet')
+        elif self.wallet_type == 'multisig':
+            assert has_xpub
+            if t1 not in ['standard', 'p2wsh', 'p2wsh-p2sh']:
+                self.show_error(_('Wrong key type') + ' %s'%t1)
+                self.run('choose_keystore')
+                return
+            if k.xpub in map(lambda x: x.xpub, self.keystores):
+                self.show_error(_('Error: duplicate master public key'))
+                self.run('choose_keystore')
+                return
+            if len(self.keystores)>0:
+                t2 = xpub_type(self.keystores[0].xpub)
+                if t1 != t2:
+                    self.show_error(_('Cannot add this cosigner:') + '\n' + "Their key type is '%s', we are '%s'"%(t1, t2))
+                    self.run('choose_keystore')
+                    return
+            self.keystores.append(k)
+            if len(self.keystores) == 1:
+                xpub = k.get_master_public_key()
+                self.stack = []
+                self.run('show_xpub_and_add_cosigners', xpub)
+            elif len(self.keystores) < self.n:
+                self.run('choose_keystore')
+            else:
+                self.run('create_wallet')
+
+    def create_wallet(self):
+        encrypt_keystore = any(k.may_have_password() for k in self.keystores)
+        # note: the following condition ("if") is duplicated logic from
+        # wallet.get_available_storage_encryption_version()
+        if self.wallet_type == 'standard' and isinstance(self.keystores[0], keystore.Hardware_KeyStore):
+            # offer encrypting with a pw derived from the hw device
+            k = self.keystores[0]
+            try:
+                k.handler = self.plugin.create_handler(self)
+                password = k.get_password_for_storage_encryption()
+            except UserCancelled:
+                devmgr = self.plugins.device_manager
+                devmgr.unpair_xpub(k.xpub)
+                self.choose_hw_device()
+                return
+            except BaseException as e:
+                traceback.print_exc(file=sys.stderr)
+                self.show_error(str(e))
+                return
+            self.request_storage_encryption(
+                run_next=lambda encrypt_storage: self.on_password(
+                    password,
+                    encrypt_storage=encrypt_storage,
+                    storage_enc_version=STO_EV_XPUB_PW,
+                    encrypt_keystore=False))
+        else:
+            # prompt the user to set an arbitrary password
+            self.request_password(
+                run_next=lambda password, encrypt_storage: self.on_password(
+                    password,
+                    encrypt_storage=encrypt_storage,
+                    storage_enc_version=STO_EV_USER_PW,
+                    encrypt_keystore=encrypt_keystore),
+                force_disable_encrypt_cb=not encrypt_keystore)
+
+    def on_password(self, password, *, encrypt_storage,
+                    storage_enc_version=STO_EV_USER_PW, encrypt_keystore):
+        self.storage.set_keystore_encryption(bool(password) and encrypt_keystore)
+        if encrypt_storage:
+            self.storage.set_password(password, enc_version=storage_enc_version)
+        for k in self.keystores:
+            if k.may_have_password():
+                k.update_password(None, password)
+        if self.wallet_type == 'standard':
+            self.storage.put('seed_type', self.seed_type)
+            keys = self.keystores[0].dump()
+            self.storage.put('keystore', keys)
+            self.wallet = Standard_Wallet(self.storage)
+            self.run('create_addresses')
+        elif self.wallet_type == 'multisig':
+            for i, k in enumerate(self.keystores):
+                self.storage.put('x%d/'%(i+1), k.dump())
+            self.storage.write()
+            self.wallet = Multisig_Wallet(self.storage)
+            self.run('create_addresses')
+        elif self.wallet_type == 'imported':
+            if len(self.keystores) > 0:
+                keys = self.keystores[0].dump()
+                self.storage.put('keystore', keys)
+            self.wallet = Imported_Wallet(self.storage)
+            self.wallet.storage.write()
+            self.terminate()
+
+    def show_xpub_and_add_cosigners(self, xpub):
+        self.show_xpub_dialog(xpub=xpub, run_next=lambda x: self.run('choose_keystore'))
+
+    def choose_seed_type(self):
+        title = _('Choose Seed type')
+        message = ' '.join([
+            _("The type of addresses used by your wallet will depend on your seed."),
+            _("Segwit wallets use bech32 addresses, defined in BIP173."),
+            _("Please note that websites and other wallets may not support these addresses yet."),
+            _("Thus, you might want to keep using a non-segwit wallet in order to be able to receive bitcoins during the transition period.")
+        ])
+        choices = [
+            ('create_standard_seed', _('Standard')),
+            ('create_segwit_seed', _('Segwit')),
+        ]
+        self.choice_dialog(title=title, message=message, choices=choices, run_next=self.run)
+
+    def create_segwit_seed(self): self.create_seed('segwit')
+    def create_standard_seed(self): self.create_seed('standard')
+
+    def create_seed(self, seed_type):
+        from . import mnemonic
+        self.seed_type = seed_type
+        seed = mnemonic.Mnemonic('en').make_seed(self.seed_type)
+        self.opt_bip39 = False
+        f = lambda x: self.request_passphrase(seed, x)
+        self.show_seed_dialog(run_next=f, seed_text=seed)
+
+    def request_passphrase(self, seed, opt_passphrase):
+        if opt_passphrase:
+            f = lambda x: self.confirm_seed(seed, x)
+            self.passphrase_dialog(run_next=f)
+        else:
+            self.run('confirm_seed', seed, '')
+
+    def confirm_seed(self, seed, passphrase):
+        f = lambda x: self.confirm_passphrase(seed, passphrase)
+        self.confirm_seed_dialog(run_next=f, test=lambda x: x==seed)
+
+    def confirm_passphrase(self, seed, passphrase):
+        f = lambda x: self.run('create_keystore', seed, x)
+        if passphrase:
+            title = _('Confirm Seed Extension')
+            message = '\n'.join([
+                _('Your seed extension must be saved together with your seed.'),
+                _('Please type it here.'),
+            ])
+            self.line_dialog(run_next=f, title=title, message=message, default='', test=lambda x: x==passphrase)
+        else:
+            f('')
+
+    def create_addresses(self):
+        def task():
+            self.wallet.synchronize()
+            self.wallet.storage.write()
+            self.terminate()
+        msg = _("Electrum is generating your addresses, please wait...")
+        self.waiting_dialog(task, msg)
