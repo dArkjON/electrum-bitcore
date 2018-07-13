@@ -417,7 +417,7 @@ class WalletStorage(PrintError):
                     d['seed'] = seed
                 self.put(key, d)
         else:
-            raise
+            raise Exception('Unable to tell wallet type. Is this even a wallet file?')
         # remove junk
         self.put('master_public_key', None)
         self.put('master_public_keys', None)
